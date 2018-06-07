@@ -69,13 +69,20 @@ def look_for_client_data(clients):
     rdy, _, _ = select.select(client_dict.keys(), [], [], 0)
     _, can_send, _ = select.select([], client_dict.keys(), [], 0)
     for rdy_sock in rdy:
-        dat = rdy_sock.recv(1024)
-        if dat != b"":
-            log_data(client_dict[rdy_sock], dat)
-            if rdy_sock in can_send:
-                rdy_sock.send(dat)
+        try:
+            dat = rdy_sock.recv(1024)
+        except ConnectionResetError as e:
+            log_conn_reset(client_dict[rdy_sock])
         else:
-            log_closed_early(client_dict[rdy_sock])
+            if dat != b"":
+                log_data(client_dict[rdy_sock], dat)
+                if rdy_sock in can_send:
+                    try:
+                        rdy_sock.send(dat)
+                    except ConnectionResetError as e:
+                        log_conn_reset(client_dict[rdy_sock])
+            else:
+                log_closed_early(client_dict[rdy_sock])
 
 def close_clients(clients):
     """
@@ -92,7 +99,7 @@ def hex_fmt_data(data):
 
     ret = ""
     for ind in range(0, len(data), seg_length):
-        dat_seg = data[ind:ind+8]
+        dat_seg = data[ind:ind+seg_length]
         bin_asc = binascii.hexlify(dat_seg).decode("ascii")
         filtered_dat = [(chr(c) if c in white_list else ".") for c in dat_seg]
         filt_txt = "".join(filtered_dat)
@@ -112,6 +119,9 @@ def log_new_client(client):
 
 def log_closed_early(client):
     logger.info("Client {} - closed early".format(fmt_client(client)))
+
+def log_conn_reset(client):
+    logger.info("Client {} - connection reset".format(fmt_client(client)))
 
 def log_close_client(client):
     logger.info("Closed client {}".format(fmt_client(client)))
