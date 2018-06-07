@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import binascii
 import itertools
 import logging
@@ -20,8 +21,12 @@ LOOP_PERIOD = 1
 
 logger = logging.getLogger("echo_and_log")
 
+
+
+
+# From https://stackoverflow.com/questions/2699907/dropping-root-permissions-in-python
 def drop_privileges(uid_name='nobody', gid_name='nogroup'):
-    # From https://stackoverflow.com/questions/2699907/dropping-root-permissions-in-python
+
     if os.getuid() != 0:
         # We're not root so, like, whatever dude
         return
@@ -40,7 +45,13 @@ def drop_privileges(uid_name='nobody', gid_name='nogroup'):
     # Ensure a very conservative umask
     old_umask = os.umask(0o77)
 
+
+
+
 def start_listen_sock(port, addr="0.0.0.0"):
+    """
+    :returns socket:
+    """
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((addr, port))
@@ -48,9 +59,20 @@ def start_listen_sock(port, addr="0.0.0.0"):
     return s
 
 def start_listen_socks(port_list):
+    """
+    :returns list of tuples: [(listening socket, port), ...]
+    """
     return [(start_listen_sock(port), port) for port in port_list]
 
 def look_for_connect_request(listen_sock_list):
+    """
+    Look, across all listening sockets, to find a connection request
+    Does not block
+    :param list listen_sock_list: 
+    :returns list of tuples: 
+        A list of connected clients in a standard tuple format:
+        [(client socket, client addr, port client connected to), ...]
+    """
     sock_dict = {sock[0]: sock for sock in listen_sock_list}
     rdy, _, _ = select.select(sock_dict.keys(), [], [], 0)
     new_clients = [(rdy_sock.accept(), sock_dict[rdy_sock][1])
@@ -63,7 +85,11 @@ def look_for_connect_request(listen_sock_list):
 
 def look_for_client_data(clients):
     """
-    Only expect to be able to iterate over clients once...
+    Look, across all clients, to find data available for reading
+    When data is found, echo it back and log it
+    :param iter clients:
+        See "look_for_connect_request" for client tuple format
+        Only expect to be able to iterate over clients once...
     """
     client_dict = {client[0]: client for client in clients}
     rdy, _, _ = select.select(client_dict.keys(), [], [], 0)
@@ -86,14 +112,24 @@ def look_for_client_data(clients):
 
 def close_clients(clients):
     """
-    Only expect to be able to iterate over clients once...
+    Close client connections gracefully
+    :param iter clients:
+        See "look_for_connect_request" for client tuple format
+        Only expect to be able to iterate over clients once...
     """
     for client in clients:
         client[0].close()
         log_close_client(client)
 
+
+
+
 def hex_fmt_data(data):
-    char_white_list = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-=_+[]{}:;\"'\\|,.<>/?`~ "
+    """
+    Format data into an xxd-like representation for logging
+    """
+    char_white_list = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"\
+            "0123456789!@#$%^&*()-=_+[]{}:;\"'\\|,.<>/?`~ "
     white_list = [ord(i) for i in char_white_list]
     seg_length = 16
 
@@ -107,6 +143,9 @@ def hex_fmt_data(data):
     return ret
 
 def fmt_client(client):
+    """
+    Format client connection info nicely for logging
+    """
     addr = client[1]
     return "{}:{}->local:{}".format(addr[0], addr[1], client[2])
 
@@ -126,7 +165,14 @@ def log_conn_reset(client):
 def log_close_client(client):
     logger.info("Closed client {}".format(fmt_client(client)))
 
+
+
+
 def main_loop(port_list):
+    """
+    The main loop for execution - ends with an exception (including Ctrl+C)
+    :param list port_list: A list of integers of ports to listen on
+    """
     listen_sock_list = start_listen_socks(port_list)
     drop_privileges()
 
@@ -137,17 +183,35 @@ def main_loop(port_list):
         new_clients = look_for_connect_request(listen_sock_list)
         client_list.insert(0, new_clients)
         if len(client_list) > CLIENT_AGE_OUT:
-            age_off = itertools.chain(*client_list[CLIENT_AGE_OUT:])
+            age_off = itertools.chain.from_iterable(
+                    client_list[CLIENT_AGE_OUT:]
+                    )
             close_clients(age_off)
             client_list = client_list[:CLIENT_AGE_OUT]
 
-        look_for_client_data(itertools.chain(*client_list))
+        look_for_client_data(itertools.chain.from_iterable(client_list))
 
         time.sleep(LOOP_PERIOD)
 
+
+
+def port_list_type(str_input):
+    try:
+        return {int(i.strip(), 0) for i in str_input.split(",")}
+    except:
+        raise argparse.ArgumentTypeError(
+                "Port list must consist of integers separated by commas")
+
 if __name__ == "__main__":
-    port_list = {69, 445, 8545, 3389, 2323, 5555, 5060, 6379, 2004,
-            81, 8888, 123, 3392}
+    port_list = \
+            "69,445,8545,3389,2323,5555,5060,6379,2004,81,8888,123,3392"
+
+    parser = argparse.ArgumentParser(description=
+            "Listen to ports, echo and log the data received at them")
+    parser.add_argument("-p", "--port-list", type=port_list_type,
+            help="A comma-separated list of integers for ports to listen to",
+            default=port_list)
+    args = parser.parse_args()
 
     logger.addHandler(logging.StreamHandler())
     #logger.addHandler(logging.handlers.SysLogHandler(address="/dev/log"))
@@ -158,4 +222,4 @@ if __name__ == "__main__":
 
     logger.setLevel(logging.INFO)
 
-    main_loop(port_list)
+    main_loop(args.port_list)
