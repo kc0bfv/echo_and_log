@@ -19,6 +19,9 @@ CLIENT_AGE_OUT = 10
 # Number of seconds each loop takes
 LOOP_PERIOD = 1
 
+ASCII_WHITE_LIST = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-=_+[]{}:;\"'\\|,.<>/?`~ "
+
+
 logger = logging.getLogger("echo_and_log")
 
 
@@ -64,73 +67,159 @@ def start_listen_socks(port_list):
     """
     return [(start_listen_sock(port), port) for port in port_list]
 
-def look_for_connect_request(listen_sock_list):
-    """
-    Look, across all listening sockets, to find a connection request
-    Does not block
-    :param list listen_sock_list: 
-    :returns list of tuples: 
-        A list of connected clients in a standard tuple format:
-        [(client socket, client addr, port client connected to), ...]
-    """
-    sock_dict = {sock[0]: sock for sock in listen_sock_list}
-    rdy, _, _ = select.select(sock_dict.keys(), [], [], 0)
-    new_clients = [(rdy_sock.accept(), sock_dict[rdy_sock][1])
-            for rdy_sock in rdy]
-    fixed_new = [(sock, client_addr, port) 
-            for ((sock, client_addr), port) in new_clients]
-    for client in fixed_new:
-        log_new_client(client)
-    return fixed_new
 
-def look_for_client_data(clients):
+class ClientList(list):
     """
-    Look, across all clients, to find data available for reading
-    When data is found, echo it back and log it
-    :param iter clients:
-        See "look_for_connect_request" for client tuple format
-        Only expect to be able to iterate over clients once...
+    Maintain clients, take actions affecting all clients
     """
-    client_dict = {client[0]: client for client in clients}
-    rdy, _, _ = select.select(client_dict.keys(), [], [], 0)
-    _, can_send, _ = select.select([], client_dict.keys(), [], 0)
-    for rdy_sock in rdy:
+    def __init__(self, listen_socks):
+        """
+        :param list listen_socks: A list containing listening sockets
+        """
+        self.listen_socks = listen_socks
+
+    def run_time_step(self):
+        self.look_for_new_clients()
+        self.echo_and_log()
+        self.age_clients()
+        self.remove_dead_clients()
+
+    def look_for_new_clients(self):
+        """
+        Look, across all listening sockets, to find a connection request
+        Does not block
+        """
+        sock_dict = {sock[0]: sock for sock in self.listen_socks}
+        rdy, _, _ = select.select(sock_dict.keys(), [], [], 0)
+        self.extend(Client(sock_dict[rdy_sock]) for rdy_sock in rdy)
+
+    def echo_and_log(self):
+        """
+        Look, across all clients, to find data available for reading
+        When data is found, echo it back and store it for logging
+        """
+        socks = {client.sock: client for client in self}
+        can_recv, can_send, _ = select.select(socks.keys(), socks.keys(), 
+                [], 0)
+        for sock in can_recv:
+            socks[sock].handle_data(sock in can_send)
+
+    def age_clients(self):
+        """
+        Increase all clients' ages
+        """
+        _ = [client.inc_age() for client in self]
+
+    def remove_dead_clients(self):
+        """
+        Replace the list with one containing only alive clients
+        """
+        self[:] = [client for client in self if not client.dead]
+
+
+class Client:
+    """
+    Handle all requirements for a connected client
+    """
+    def __init__(self, listen_sock_and_port):
+        """
+        Accept a connection on listen_sock, and become a new client
+        """
+        self.listen_sock = listen_sock_and_port[0]
+        self.listen_port = listen_sock_and_port[1]
+        self.sock, client_conn = self.listen_sock.accept()
+        self.client_addr = client_conn[0]
+        self.client_port = client_conn[1]
+        self.data = b""
+        self.age = 0
+        self.dead = False
+    
+    def inc_age(self):
+        """
+        Increase the client's age, and kill it if it's too old
+        """
+        self.age += 1
+        if self.age > CLIENT_AGE_OUT:
+            self.die()
+
+    def die(self):
+        """
+        Handle the client's death nicely - close the socket and emit logs
+        """
+        self.sock.close()
+        self.dead = True
+        self.write_log()
+
+    def write_log(self):
+        """
+        Emit one consolidated log entry for the client
+        """
+        white_list = [ord(i) for i in ASCII_WHITE_LIST]
+        filt_dat = [(chr(c) if c in white_list else ".") for c in self.data]
+        ascii_friendly_data = "".join(filt_dat)
+
+        log_dict = {
+                "client_addr": self.client_addr,
+                "client_port": self.client_port,
+                "server_port": self.listen_port,
+                "closed_early": self.age <= CLIENT_AGE_OUT,
+                "data_hex": binascii.hexlify(self.data).decode("ascii"),
+                "data_ascii": ascii_friendly_data,
+                "data_xxd": hex_fmt_data(self.data, "\n"),
+                }
+
+        str_fmt = "{}:{}->local:{} {}{}".format(
+                log_dict["client_addr"],
+                log_dict["client_port"],
+                log_dict["server_port"],
+                "closed early " if log_dict["closed_early"] else "",
+                log_dict["data_xxd"]
+                )
+
+        logger.info(str_fmt)
+
+    def close_early(self):
+        """
+        Handle when the client closed earlier than age-related death
+        """
+        self.die()
+
+    def handle_data(self, try_send):
+        """
+        Assumes data is available for read!  Don't call on dead clients...
+        :param bool try_send:
+            If true, try to send data.  If you want to avoid blocking, set
+            this parameter based on the output of a select statement
+        """
+        if self.dead:
+            raise RuntimeError("Tried to handle data on dead client")
+
         try:
-            dat = rdy_sock.recv(1024)
+            dat = self.sock.recv(1024)
         except ConnectionResetError as e:
-            log_conn_reset(client_dict[rdy_sock])
-        else:
-            if dat != b"":
-                log_data(client_dict[rdy_sock], dat)
-                if rdy_sock in can_send:
-                    try:
-                        rdy_sock.send(dat)
-                    except ConnectionResetError as e:
-                        log_conn_reset(client_dict[rdy_sock])
-            else:
-                log_closed_early(client_dict[rdy_sock])
+            self.close_early()
+            return
 
-def close_clients(clients):
-    """
-    Close client connections gracefully
-    :param iter clients:
-        See "look_for_connect_request" for client tuple format
-        Only expect to be able to iterate over clients once...
-    """
-    for client in clients:
-        client[0].close()
-        log_close_client(client)
+        if dat == b"":
+            self.close_early()
+            return
 
+        self.data += dat
 
+        if try_send:
+            try:
+                self.sock.send(dat)
+            except ConnectionResetError as e:
+                self.close_early()
+                return
+        
+        return
 
-
-def hex_fmt_data(data):
+def hex_fmt_data(data, separator="     "):
     """
     Format data into an xxd-like representation for logging
     """
-    char_white_list = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"\
-            "0123456789!@#$%^&*()-=_+[]{}:;\"'\\|,.<>/?`~ "
-    white_list = [ord(i) for i in char_white_list]
+    white_list = [ord(i) for i in ASCII_WHITE_LIST]
     seg_length = 16
 
     ret = ""
@@ -139,33 +228,8 @@ def hex_fmt_data(data):
         bin_asc = binascii.hexlify(dat_seg).decode("ascii")
         filtered_dat = [(chr(c) if c in white_list else ".") for c in dat_seg]
         filt_txt = "".join(filtered_dat)
-        ret += "     {} {}".format(bin_asc, filt_txt) 
+        ret += "{}{} {}".format(separator, bin_asc, filt_txt) 
     return ret
-
-def fmt_client(client):
-    """
-    Format client connection info nicely for logging
-    """
-    addr = client[1]
-    return "{}:{}->local:{}".format(addr[0], addr[1], client[2])
-
-def log_data(client, data):
-    data_fmt = hex_fmt_data(data)
-    logger.info("Client {} - data:{}".format(fmt_client(client), data_fmt))
-
-def log_new_client(client):
-    logger.info("New client {}".format(fmt_client(client)))
-
-def log_closed_early(client):
-    logger.info("Client {} - closed early".format(fmt_client(client)))
-
-def log_conn_reset(client):
-    logger.info("Client {} - connection reset".format(fmt_client(client)))
-
-def log_close_client(client):
-    logger.info("Closed client {}".format(fmt_client(client)))
-
-
 
 
 def main_loop(port_list):
@@ -175,22 +239,9 @@ def main_loop(port_list):
     """
     listen_sock_list = start_listen_socks(port_list)
     drop_privileges()
-
-    # client_list will become a list of lists, max length CLIENT_AGE_OUT
-    client_list = list()
-
+    client_list = ClientList(listen_sock_list)
     while True:
-        new_clients = look_for_connect_request(listen_sock_list)
-        client_list.insert(0, new_clients)
-        if len(client_list) > CLIENT_AGE_OUT:
-            age_off = itertools.chain.from_iterable(
-                    client_list[CLIENT_AGE_OUT:]
-                    )
-            close_clients(age_off)
-            client_list = client_list[:CLIENT_AGE_OUT]
-
-        look_for_client_data(itertools.chain.from_iterable(client_list))
-
+        client_list.run_time_step()
         time.sleep(LOOP_PERIOD)
 
 
