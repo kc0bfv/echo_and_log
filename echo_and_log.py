@@ -49,23 +49,55 @@ def drop_privileges(uid_name='nobody', gid_name='nogroup'):
     old_umask = os.umask(0o77)
 
 
+class ListenList(list):
+    def __init__(self, port_list):
+        tcp_socks = [ListenSockTCP(port) for port in port_list]
+        udp_socks = [ListenSockUDP(port) for port in port_list]
+        self[:] = tcp_socks + udp_socks
+
+class ListenSock:
+    sock_type = None
+    def __init__(self, port, addr="0.0.0.0"):
+        self.port = port
+        self.addr = addr
+        self.sock = socket.socket(type=self.sock_type)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.addr, self.port))
+
+    def handle_recv(self):
+        """
+        Handle whatever's necessary for this sock_type when data
+        is available to recv - on TCP, accept a connection, on UDP, recv data
+        """
+        raise RuntimeError("Called handle_recv on parent ListenSock class")
+
+class ListenSockTCP(ListenSock):
+    sock_type = socket.SOCK_STREAM
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sock.listen(10)
+
+    def handle_recv(self):
+        """
+        Return a client for a connection
+        """
+        return ClientTCP(self)
+
+class ListenSockUDP(ListenSock):
+    sock_type = socket.SOCK_DGRAM
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def handle_recv(self):
+        """
+        This happens when there's data available to read, with UDP
+        Go ahead and handle it
+        :returns None:
+        """
+        ClientUDP(self)
+        return None
 
 
-def start_listen_sock(port, addr="0.0.0.0"):
-    """
-    :returns socket:
-    """
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((addr, port))
-    s.listen(10)
-    return s
-
-def start_listen_socks(port_list):
-    """
-    :returns list of tuples: [(listening socket, port), ...]
-    """
-    return [(start_listen_sock(port), port) for port in port_list]
 
 
 class ClientList(list):
@@ -79,24 +111,26 @@ class ClientList(list):
         self.listen_socks = listen_socks
 
     def run_time_step(self):
-        self.look_for_new_clients()
+        self.handle_new_clients()
         self.echo_and_log()
         self.age_clients()
         self.remove_dead_clients()
 
-    def look_for_new_clients(self):
+    def handle_new_clients(self):
         """
-        Look, across all listening sockets, to find a connection request
+        Look, across all server sockets, to find a connection request (TCP)
+        or data available to read (in the case of UDP)
         Does not block
         """
-        sock_dict = {sock[0]: sock for sock in self.listen_socks}
+        sock_dict = {listener.sock: listener for listener in self.listen_socks}
         rdy, _, _ = select.select(sock_dict.keys(), [], [], 0)
-        self.extend(Client(sock_dict[rdy_sock]) for rdy_sock in rdy)
+        new_clients = (sock_dict[rdy_sock].handle_recv() for rdy_sock in rdy)
+        self.extend(client for client in new_clients if client is not None)
 
     def echo_and_log(self):
         """
-        Look, across all clients, to find data available for reading
-        When data is found, echo it back and store it for logging
+        Look, across connection-oriented clients, to find data available for 
+        reading.  When data is found, echo it back and store it for logging.
         """
         socks = {client.sock: client for client in self}
         can_recv, can_send, _ = select.select(socks.keys(), socks.keys(), 
@@ -116,22 +150,86 @@ class ClientList(list):
         """
         self[:] = [client for client in self if not client.dead]
 
-
 class Client:
     """
-    Handle all requirements for a connected client
+    Handle all requirements for a connected client, whether UDP or TCP
     """
-    def __init__(self, listen_sock_and_port):
-        """
-        Accept a connection on listen_sock, and become a new client
-        """
-        self.listen_sock = listen_sock_and_port[0]
-        self.listen_port = listen_sock_and_port[1]
-        self.sock, client_conn = self.listen_sock.accept()
-        self.client_addr = client_conn[0]
-        self.client_port = client_conn[1]
-        self.data = b""
+    server_type = None
+    def __init__(self, listen_sock):
+        self.listen_sock = listen_sock
         self.age = 0
+        self.closed_early = False
+
+    def hex_fmt_data(self, separator="\n"):
+        """
+        Format data into an xxd-like representation for logging
+        """
+        white_list = [ord(i) for i in ASCII_WHITE_LIST]
+        seg_length = 16
+
+        ret = ""
+        for ind in range(0, len(self.data), seg_length):
+            dat_seg = self.data[ind:ind+seg_length]
+            bin_asc = binascii.hexlify(dat_seg).decode("ascii")
+            filtered_dat = [(chr(c) if c in white_list else ".") for c in dat_seg]
+            filt_txt = "".join(filtered_dat)
+            ret += "{}{} {}".format(separator, bin_asc, filt_txt) 
+        return ret
+
+    def write_log(self):
+        """
+        Emit one consolidated log entry for the client
+        """
+        white_list = [ord(i) for i in ASCII_WHITE_LIST]
+        filt_dat = [(chr(c) if c in white_list else ".") for c in self.data]
+        ascii_friendly_data = "".join(filt_dat)
+
+        log_dict = {
+                "client_addr": self.client_addr,
+                "client_port": self.client_port,
+                "server_port": self.listen_sock.port,
+                "server_type": self.server_type,
+                "closed_early": self.closed_early,
+                "data_hex": binascii.hexlify(self.data).decode("ascii"),
+                "data_ascii": ascii_friendly_data,
+                "data_xxd": self.hex_fmt_data(),
+                }
+
+        str_fmt = "{}:{}->local:{} {} {}{}".format(
+                log_dict["client_addr"],
+                log_dict["client_port"],
+                log_dict["server_port"],
+                log_dict["server_type"],
+                "closed early " if log_dict["closed_early"] else "",
+                self.hex_fmt_data("     "),
+                )
+
+        logger.info(str_fmt)
+
+class ClientUDP(Client):
+    server_type = "UDP"
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.data, client = self.listen_sock.sock.recvfrom(1024)
+        self.listen_sock.sock.sendto(self.data, client)
+        self.client_addr, self.client_port = client
+        self.write_log()
+
+    def handle_data(self, try_send):
+        raise RuntimeError("Attempted handle_data on UDP")
+
+class ClientTCP(Client):
+    server_type = "TCP"
+    def __init__(self, *args, **kwargs):
+        """
+        Accept a connection on listensock, and become a new client
+        """
+        super().__init__(*args, **kwargs)
+
+        self.sock, client = self.listen_sock.sock.accept()
+        self.client_addr, self.client_port = client
+        self.data = b""
         self.dead = False
     
     def inc_age(self):
@@ -150,38 +248,12 @@ class Client:
         self.dead = True
         self.write_log()
 
-    def write_log(self):
-        """
-        Emit one consolidated log entry for the client
-        """
-        white_list = [ord(i) for i in ASCII_WHITE_LIST]
-        filt_dat = [(chr(c) if c in white_list else ".") for c in self.data]
-        ascii_friendly_data = "".join(filt_dat)
-
-        log_dict = {
-                "client_addr": self.client_addr,
-                "client_port": self.client_port,
-                "server_port": self.listen_port,
-                "closed_early": self.age <= CLIENT_AGE_OUT,
-                "data_hex": binascii.hexlify(self.data).decode("ascii"),
-                "data_ascii": ascii_friendly_data,
-                "data_xxd": hex_fmt_data(self.data, "\n"),
-                }
-
-        str_fmt = "{}:{}->local:{} {}{}".format(
-                log_dict["client_addr"],
-                log_dict["client_port"],
-                log_dict["server_port"],
-                "closed early " if log_dict["closed_early"] else "",
-                log_dict["data_xxd"]
-                )
-
-        logger.info(str_fmt)
 
     def close_early(self):
         """
         Handle when the client closed earlier than age-related death
         """
+        self.closed_early = True
         self.die()
 
     def handle_data(self, try_send):
@@ -215,21 +287,9 @@ class Client:
         
         return
 
-def hex_fmt_data(data, separator="     "):
-    """
-    Format data into an xxd-like representation for logging
-    """
-    white_list = [ord(i) for i in ASCII_WHITE_LIST]
-    seg_length = 16
 
-    ret = ""
-    for ind in range(0, len(data), seg_length):
-        dat_seg = data[ind:ind+seg_length]
-        bin_asc = binascii.hexlify(dat_seg).decode("ascii")
-        filtered_dat = [(chr(c) if c in white_list else ".") for c in dat_seg]
-        filt_txt = "".join(filtered_dat)
-        ret += "{}{} {}".format(separator, bin_asc, filt_txt) 
-    return ret
+
+
 
 
 def main_loop(port_list):
@@ -237,9 +297,9 @@ def main_loop(port_list):
     The main loop for execution - ends with an exception (including Ctrl+C)
     :param list port_list: A list of integers of ports to listen on
     """
-    listen_sock_list = start_listen_socks(port_list)
+    listen_socks = ListenList(port_list)
     drop_privileges()
-    client_list = ClientList(listen_sock_list)
+    client_list = ClientList(listen_socks)
     while True:
         client_list.run_time_step()
         time.sleep(LOOP_PERIOD)
