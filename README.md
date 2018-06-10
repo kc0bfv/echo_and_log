@@ -9,3 +9,6 @@ The purpose is to characterize the data sent to arbitrary ports, enabling users 
 sudo ./echo\_and\_log.py -p "15,20,30,55"
 
 Sudo is not necessary if you're using unprivileged ports, or have set capabilities correctly.  Echo\_and\_log's first steps, though, are to begin listening and drop root privileges, hopefully mitigating most problems with running as root.
+
+# Requires
+python-logstash

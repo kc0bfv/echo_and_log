@@ -5,6 +5,7 @@ import binascii
 import itertools
 import logging
 import logging.handlers
+import logstash
 import select
 import socket
 import syslog
@@ -21,6 +22,8 @@ LOOP_PERIOD = 1
 
 ASCII_WHITE_LIST = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-=_+[]{}:;\"'\\|,.<>/?`~ "
 
+LOGSTASH_HOST = "localhost"
+LOGSTASH_PORT = 5959
 
 logger = logging.getLogger("echo_and_log")
 
@@ -204,7 +207,7 @@ class Client:
                 self.hex_fmt_data("     "),
                 )
 
-        logger.info(str_fmt)
+        logger.info(str_fmt, extra = log_dict)
 
 class ClientUDP(Client):
     server_type = "UDP"
@@ -322,10 +325,20 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--port-list", type=port_list_type,
             help="A comma-separated list of integers for ports to listen to",
             default=port_list)
+    parser.add_argument("--logstash-server",
+            help="The server address for logstash", default = None)
+    parser.add_argument("--logstash-port", type=int,
+            help="The TCP port for logstash server", default = 5959)
     args = parser.parse_args()
 
     logger.addHandler(logging.StreamHandler())
-    #logger.addHandler(logging.handlers.SysLogHandler(address="/dev/log"))
+    if args.logstash_server is not None:
+        logger.addHandler(
+                logstash.TCPLogstashHandler(
+                    args.logstash_server,
+                    args.logstash_port,
+                    version = 1)
+                )
 
     handler = logging.handlers.SysLogHandler(address="/dev/log")
     handler.setFormatter(logging.Formatter("ECHO_AND_LOG: %(message)s"))
