@@ -274,6 +274,9 @@ class ClientTCP(Client):
         except ConnectionResetError as e:
             self.close_early()
             return
+        except BrokenPipeError as e:
+            self.close_early()
+            return
 
         if dat == b"":
             self.close_early()
@@ -285,6 +288,9 @@ class ClientTCP(Client):
             try:
                 self.sock.send(dat)
             except ConnectionResetError as e:
+                self.close_early()
+                return
+            except BrokenPipeError as e:
                 self.close_early()
                 return
         
