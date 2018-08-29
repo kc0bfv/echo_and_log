@@ -335,6 +335,8 @@ if __name__ == "__main__":
             help="The server address for logstash", default = None)
     parser.add_argument("--logstash-port", type=int,
             help="The TCP port for logstash server", default = 5959)
+    parser.add_argument("-s", "--add-syslog", help="Log to syslog",
+            action="store_true")
     args = parser.parse_args()
 
     logger.addHandler(logging.StreamHandler())
@@ -346,9 +348,10 @@ if __name__ == "__main__":
                     version = 1)
                 )
 
-    handler = logging.handlers.SysLogHandler(address="/dev/log")
-    handler.setFormatter(logging.Formatter("ECHO_AND_LOG: %(message)s"))
-    logger.addHandler(handler)
+    if args.add_syslog:
+        handler = logging.handlers.SysLogHandler(address="/dev/log")
+        handler.setFormatter(logging.Formatter("ECHO_AND_LOG: %(message)s"))
+        logger.addHandler(handler)
 
     logger.setLevel(logging.INFO)
 
