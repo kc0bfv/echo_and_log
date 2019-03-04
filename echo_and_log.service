@@ -1,0 +1,16 @@
+[Unit]
+Description=Echo and Log Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/echo_and_log/echo_and_log.py
+WorkingDirectory=/opt/echo_and_log
+Restart=always
+RestartSec=120
+TimeoutSec=300
+
+[Install]
+WantedBy=multi-user.target
